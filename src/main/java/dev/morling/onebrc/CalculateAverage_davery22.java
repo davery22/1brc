@@ -15,11 +15,14 @@
  */
 package dev.morling.onebrc;
 
+import sun.misc.Unsafe;
+
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.lang.reflect.Field;
 import java.nio.ByteOrder;
-import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
@@ -29,6 +32,19 @@ public class CalculateAverage_davery22 {
     static final String FILE = "./measurements.txt";
     static final int MAP_SIZE = 1 << 16; // Must be a power of two > 10000
     static final int MAP_MASK = MAP_SIZE - 1;
+    static final boolean IS_LITTLE_ENDIAN = ByteOrder.nativeOrder().equals(ByteOrder.LITTLE_ENDIAN);
+    static final Unsafe UNSAFE;
+
+    static {
+        try {
+            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
+            theUnsafe.setAccessible(true);
+            UNSAFE = (Unsafe) theUnsafe.get(Unsafe.class);
+        }
+        catch (NoSuchFieldException | IllegalAccessException e) {
+            throw new RuntimeException(e);
+        }
+    }
 
     public static void main(String[] args) throws IOException, InterruptedException {
         FileChannel in = FileChannel.open(Paths.get(FILE), StandardOpenOption.READ);
@@ -36,25 +52,21 @@ public class CalculateAverage_davery22 {
         Thread[] threads = new Thread[concurrency - 1];
         Worker[] workers = new Worker[concurrency - 1];
         long fileSize = in.size();
-        int segmentSize = (int) (fileSize / concurrency);
-        long fileCursor = 0;
+        long segmentSize = fileSize / concurrency;
+        long start = in.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global()).address();
 
         // Process each segment in its own thread
         for (int i = 0; i < concurrency - 1; i++) {
-            MappedByteBuffer buf = in.map(FileChannel.MapMode.READ_ONLY, fileCursor, segmentSize);
-            int limit = segmentSize;
-            for (; limit > 0 && buf.get(limit - 1) != '\n'; limit--) {
+            long end = start + segmentSize;
+            for (; end > start && UNSAFE.getByte(end - 1) != '\n'; end--) {
             }
-            buf.limit(limit);
-            fileCursor += limit;
-
-            Thread t = threads[i] = new Thread(workers[i] = new Worker(buf));
+            Thread t = threads[i] = new Thread(workers[i] = new Worker(start, end));
             t.start();
+            start = end;
         }
 
         // Process last segment on main thread
-        MappedByteBuffer buf = in.map(FileChannel.MapMode.READ_ONLY, fileCursor, fileSize - fileCursor);
-        Worker main = new Worker(buf);
+        Worker main = new Worker(start, fileSize);
         main.run();
 
         for (Thread t : threads) {
@@ -96,10 +108,12 @@ public class CalculateAverage_davery22 {
         bufferLen = 0;
         toPrint[bufferLen++] = '{';
         for (int i = 0; i < entriesLen; i++) {
+            // Delimiter
             if (i > 0) {
                 toPrint[bufferLen++] = ',';
                 toPrint[bufferLen++] = ' ';
             }
+            // Name
             long[] entry = entries[i];
             int j = 0;
             for (; j < entry.length - 5; j++) {
@@ -113,6 +127,7 @@ public class CalculateAverage_davery22 {
             for (int k = 0; k < lastLen; k++) {
                 toPrint[bufferLen++] = (byte) ((last >>> (56 - k * 8)) & 0xFF);
             }
+            // Stats
             long min = entry[j++];
             long max = entry[j++];
             long sum = entry[j++];
@@ -137,34 +152,27 @@ public class CalculateAverage_davery22 {
     }
 
     static class Worker implements Runnable {
-        final MappedByteBuffer buf;
+        final long start, end;
         final int[] indexes = new int[MAP_SIZE];
         final long[][] entries = new long[MAP_SIZE][];
         int lastIndex;
 
-        Worker(MappedByteBuffer buf) {
-            this.buf = buf;
+        Worker(long start, long end) {
+            this.start = start;
+            this.end = end;
         }
 
         @Override
         public void run() {
             // Big enough for max city bytes (100 bytes) + temperature value (1 long)
             long[] item = new long[14];
-            int itemLen = 0, bufCursor = 0, bufLimit = buf.limit();
-            int lineSeparatorLen = (bufLimit > 1 && buf.get(bufLimit - 2) == '\r') ? 2 : 1;
-            boolean isLittleEndian = buf.order().equals(ByteOrder.LITTLE_ENDIAN);
+            int itemLen = 0;
+            long bufCursor = start, bufLimit = end;
+            int lineSeparatorLen = (bufLimit - bufCursor > 1 && UNSAFE.getByte(bufLimit - 2) == '\r') ? 2 : 1;
 
             while (bufCursor < bufLimit) {
                 // Parse next long of bytes, until we see a semicolon
-                long word = 0;
-                if (bufLimit - bufCursor >= 8) {
-                    word = isLittleEndian ? Long.reverseBytes(buf.getLong(bufCursor)) : buf.getLong(bufCursor);
-                }
-                else {
-                    for (int j = 0; bufCursor + j < bufLimit; j++) {
-                        word |= ((long) buf.get(bufCursor + j) & 0xFF) << (56 - j * 8);
-                    }
-                }
+                long word = IS_LITTLE_ENDIAN ? Long.reverseBytes(UNSAFE.getLong(bufCursor)) : UNSAFE.getLong(bufCursor);
                 int idx = indexOfSemicolon(word);
                 if (idx < 0) {
                     item[itemLen++] = word;
@@ -176,22 +184,23 @@ public class CalculateAverage_davery22 {
                     item[itemLen++] = word & (-1L << (64 - idx * 8));
                 }
                 // Parse the temperature value
-                bufCursor += idx + 1;
-                long sign = 1, magnitude;
-                byte b1, b2;
-                if ((b1 = buf.get(bufCursor)) == '-') {
-                    sign = -1;
-                    bufCursor += 1;
-                    b1 = buf.get(bufCursor);
-                }
-                if ((b2 = buf.get(bufCursor + 1)) == '.') {
-                    magnitude = 10 * (b1 - '0') + (buf.get(bufCursor + 2) - '0');
-                    bufCursor += 3 + lineSeparatorLen;
-                }
-                else {
-                    magnitude = 100 * (b1 - '0') + 10 * (b2 - '0') + (buf.get(bufCursor + 3) - '0');
-                    bufCursor += 4 + lineSeparatorLen;
-                }
+                 bufCursor += idx + 1;
+                 long sign = 1, magnitude;
+                 byte b1, b2;
+                 if ((b1 = UNSAFE.getByte(bufCursor)) == '-') {
+                     sign = -1;
+                     bufCursor += 1;
+                     b1 = UNSAFE.getByte(bufCursor);
+                 }
+                 if ((b2 = UNSAFE.getByte(bufCursor + 1)) == '.') {
+                     magnitude = 10 * b1 + UNSAFE.getByte(bufCursor + 2) - 528;
+                     bufCursor += 3 + lineSeparatorLen;
+                 }
+                 else {
+                     magnitude = 100 * b1 + 10 * b2 + UNSAFE.getByte(bufCursor + 3) - 5328;
+                     bufCursor += 4 + lineSeparatorLen;
+                 }
+
                 // Merge to map
                 item[itemLen++] = sign * magnitude;
                 mergeItem(item, itemLen);
@@ -204,7 +213,7 @@ public class CalculateAverage_davery22 {
         }
 
         void mergeItem(long[] item, int len) { // format [n longs for key, 1 long for value]
-            loop: for (int hash = hash(item[0]);; hash = hash + 1 < MAP_SIZE ? hash + 1 : 0) { // Linear probing
+            loop: for (int hash = hash(item[0]);; hash = (hash + 1) & MAP_MASK) { // Linear probing
                 int index = indexes[hash];
                 // Check if new
                 if (index == 0) {
@@ -238,7 +247,7 @@ public class CalculateAverage_davery22 {
         }
 
         void mergeEntry(long[] item) { // format: [n longs for key, 4 longs for min/max/sum/count]
-            loop: for (int hash = hash(item[0]);; hash = hash + 1 < MAP_SIZE ? hash + 1 : 0) { // Linear probing
+            loop: for (int hash = hash(item[0]);; hash = (hash + 1) & MAP_MASK) { // Linear probing
                 int index = indexes[hash];
                 // Check if new
                 if (index == 0) {
