@@ -49,7 +49,6 @@ public class CalculateAverage_davery22 {
     public static void main(String[] args) throws IOException, InterruptedException {
         FileChannel in = FileChannel.open(Paths.get(FILE), StandardOpenOption.READ);
         int concurrency = Runtime.getRuntime().availableProcessors();
-        Thread[] threads = new Thread[concurrency - 1];
         Worker[] workers = new Worker[concurrency - 1];
         long fileSize = in.size();
         long segmentSize = fileSize / concurrency;
@@ -60,8 +59,7 @@ public class CalculateAverage_davery22 {
             long end = start + segmentSize;
             for (; end > start && UNSAFE.getByte(end - 1) != '\n'; end--) {
             }
-            Thread t = threads[i] = new Thread(workers[i] = new Worker(start, end));
-            t.start();
+            (workers[i] = new Worker(start, end)).start();
             start = end;
         }
 
@@ -69,30 +67,30 @@ public class CalculateAverage_davery22 {
         Worker main = new Worker(start, fileSize);
         main.run();
 
-        for (Thread t : threads) {
-            t.join();
-        }
-
         // Merge maps
-        for (int i = 0; i < concurrency - 1; i++) {
-            long[][] entries = workers[i].entries;
-            for (int j = 0; entries[j] != null; j++) {
-                main.mergeEntry(entries[j]);
+        for (Worker worker : workers) {
+            worker.join();
+            for (long[] entry : worker.entries) {
+                if (entry != null) {
+                    main.mergeEntry(entry);
+                }
             }
         }
 
         // Estimate size of output buffer - okay to overestimate, not underestimate
-        long[][] entries = main.entries;
         int platformCR = System.lineSeparator().length() > 1 ? 1 : 0; // May be different from file
         int bufferLen = 3 + platformCR; // '{' and '}' and '\n' (and '\r' if detected)
         int entriesLen = 0;
-        for (; entries[entriesLen] != null; entriesLen++) {
-            // Needs enough space for: '<city_name>=<min>/<mean>/<max>, ' where the stats are up to 5 bytes each
-            bufferLen += (entries[entriesLen].length - 4) * 8 + 20;
+        for (long[] entry : main.entries) {
+            if (entry != null) {
+                // Needs enough space for: '<city_name>=<min>/<mean>/<max>, ' where the stats are up to 5 bytes each
+                bufferLen += (entry.length - 4) * 8 + 20;
+                main.entries[entriesLen++] = entry;
+            }
         }
 
         // Sort by city name
-        Arrays.sort(entries, 0, entriesLen, (a, b) -> {
+        Arrays.sort(main.entries, 0, entriesLen, (a, b) -> {
             int n = Math.min(a.length, b.length) - 4;
             for (int i = 0; i < n; i++) {
                 int cmp = Long.compareUnsigned(a[i], b[i]);
@@ -114,7 +112,7 @@ public class CalculateAverage_davery22 {
                 toPrint[bufferLen++] = ' ';
             }
             // Name
-            long[] entry = entries[i];
+            long[] entry = main.entries[i];
             int j = 0;
             for (; j < entry.length - 5; j++) {
                 long word = entry[j];
@@ -151,11 +149,9 @@ public class CalculateAverage_davery22 {
         out.write(toPrint, 0, bufferLen);
     }
 
-    static class Worker implements Runnable {
+    static class Worker extends Thread {
         final long start, end;
-        final int[] indexes = new int[MAP_SIZE];
         final long[][] entries = new long[MAP_SIZE][];
-        int lastIndex;
 
         Worker(long start, long end) {
             this.start = start;
@@ -184,22 +180,22 @@ public class CalculateAverage_davery22 {
                     item[itemLen++] = word & (-1L << (64 - idx * 8));
                 }
                 // Parse the temperature value
-                 bufCursor += idx + 1;
-                 long sign = 1, magnitude;
-                 byte b1, b2;
-                 if ((b1 = UNSAFE.getByte(bufCursor)) == '-') {
-                     sign = -1;
-                     bufCursor += 1;
-                     b1 = UNSAFE.getByte(bufCursor);
-                 }
-                 if ((b2 = UNSAFE.getByte(bufCursor + 1)) == '.') {
-                     magnitude = 10 * b1 + UNSAFE.getByte(bufCursor + 2) - 528;
-                     bufCursor += 3 + lineSeparatorLen;
-                 }
-                 else {
-                     magnitude = 100 * b1 + 10 * b2 + UNSAFE.getByte(bufCursor + 3) - 5328;
-                     bufCursor += 4 + lineSeparatorLen;
-                 }
+                bufCursor += idx + 1;
+                long sign = 1, magnitude;
+                byte b1, b2;
+                if ((b1 = UNSAFE.getByte(bufCursor)) == '-') {
+                    sign = -1;
+                    bufCursor += 1;
+                    b1 = UNSAFE.getByte(bufCursor);
+                }
+                if ((b2 = UNSAFE.getByte(bufCursor + 1)) == '.') {
+                    magnitude = 10 * b1 + UNSAFE.getByte(bufCursor + 2) - 528;
+                    bufCursor += 3 + lineSeparatorLen;
+                }
+                else {
+                    magnitude = 100 * b1 + 10 * b2 + UNSAFE.getByte(bufCursor + 3) - 5328;
+                    bufCursor += 4 + lineSeparatorLen;
+                }
 
                 // Merge to map
                 item[itemLen++] = sign * magnitude;
@@ -208,78 +204,69 @@ public class CalculateAverage_davery22 {
             }
         }
 
-        static int hash(long word) {
-            return (int) (word ^ (word >>> 16) * (word >>> 32) ^ (word >>> 48)) & MAP_MASK;
+        static long hash(long word) {
+            return word ^ (word >>> 16) * (word >>> 32) ^ (word >>> 48);
+        }
+
+        static boolean arrayEquals(long[] a, long[] b, int len) {
+            for (int i = 0; i < len; i++) {
+                if (a[i] != b[i]) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         void mergeItem(long[] item, int len) { // format [n longs for key, 1 long for value]
-            loop: for (int hash = hash(item[0]);; hash = (hash + 1) & MAP_MASK) { // Linear probing
-                int index = indexes[hash];
+            for (int idx = (int) (hash(item[0]) & MAP_MASK);; idx = (idx + 1) & MAP_MASK) { // Linear probing
+                long[] entry = entries[idx];
                 // Check if new
-                if (index == 0) {
-                    long[] entry = new long[len + 3];
+                if (entry == null) {
+                    entry = new long[len + 3];
                     System.arraycopy(item, 0, entry, 0, len);
                     entry[len] = item[len - 1]; // initial max
                     entry[len + 1] = item[len - 1]; // initial sum
                     entry[len + 2] = 1; // initial count
-                    indexes[hash] = ++lastIndex;
-                    entries[lastIndex - 1] = entry;
+                    entries[idx] = entry;
                     return;
                 }
-                // Check if equal or conflict
-                long[] entry = entries[index - 1];
-                if (entry.length != len + 3) {
-                    continue;
+                // Check if equal
+                int i = len - 1;
+                if (entry.length == len + 3 && arrayEquals(entry, item, i)) {
+                    entry[i] = Math.min(entry[i], item[i]); // min
+                    entry[i + 1] = Math.max(entry[i + 1], item[i]); // max
+                    entry[i + 2] += item[i]; // sum
+                    entry[i + 3] += 1; // count
+                    return;
                 }
-                int i = 0;
-                for (; i < len - 1; i++) {
-                    if (entry[i] != item[i]) {
-                        continue loop;
-                    }
-                }
-                // Equal - update stats
-                entry[i] = Math.min(entry[i], item[i]); // min
-                entry[i + 1] = Math.max(entry[i + 1], item[i]); // max
-                entry[i + 2] += item[i]; // sum
-                entry[i + 3] += 1; // count
-                return;
             }
         }
 
         void mergeEntry(long[] item) { // format: [n longs for key, 4 longs for min/max/sum/count]
-            loop: for (int hash = hash(item[0]);; hash = (hash + 1) & MAP_MASK) { // Linear probing
-                int index = indexes[hash];
+            for (int idx = (int) (hash(item[0]) & MAP_MASK);; idx = (idx + 1) & MAP_MASK) { // Linear probing
+                long[] entry = entries[idx];
                 // Check if new
-                if (index == 0) {
-                    indexes[hash] = ++lastIndex;
-                    entries[lastIndex - 1] = item;
+                if (entry == null) {
+                    entries[idx] = item;
                     return;
                 }
-                // Check if equal or conflict
-                long[] entry = entries[index - 1];
-                if (entry.length != item.length) {
-                    continue;
+                // Check if equal
+                int i = item.length - 4;
+                if (entry.length == item.length && arrayEquals(entry, item, i)) {
+                    entry[i] = Math.min(entry[i], item[i]); // min
+                    entry[i + 1] = Math.max(entry[i + 1], item[i + 1]); // max
+                    entry[i + 2] += item[i + 2]; // sum
+                    entry[i + 3] += item[i + 3]; // count
+                    return;
                 }
-                int i = 0;
-                for (; i < item.length - 4; i++) {
-                    if (entry[i] != item[i]) {
-                        continue loop;
-                    }
-                }
-                // Equal - update stats
-                entry[i] = Math.min(entry[i], item[i]); // min
-                entry[i + 1] = Math.max(entry[i + 1], item[i + 1]); // max
-                entry[i + 2] += item[i + 2]; // sum
-                entry[i + 3] += item[i + 3]; // count
-                return;
             }
         }
     }
-
-    // SWAR search based on royvanrijn's code
+    
     static final long SEMICOLON_PATTERN = ((long) ';' << 56) | ((long) ';' << 48) | ((long) ';' << 40) | ((long) ';' << 32) |
-            ((long) ';' << 24) | ((long) ';' << 16) | ((long) ';' << 8) | ((long) ';');
-
+        ((long) ';' << 24) | ((long) ';' << 16) | ((long) ';' << 8) | ((long) ';');
+    
+    // SWAR search based on royvanrijn's code
     static int indexOfSemicolon(long word) {
         long match = word ^ SEMICOLON_PATTERN; // Only matching bytes are zero
         long mask = ((match - 0x0101010101010101L) & ~match) & 0x8080808080808080L; // Only matching bytes are non-zero (leftmost bit is 1)
